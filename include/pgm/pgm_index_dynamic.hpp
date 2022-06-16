@@ -31,6 +31,8 @@
 #include <vector>
 #include <iostream>
 
+#include "nvm_alloc.h"
+
 namespace pgm {
 
 /**
@@ -46,7 +48,15 @@ class DynamicPGMIndex {
     class Iterator;
 
     using Item = std::conditional_t<std::is_pointer_v<V> || std::is_arithmetic_v<V>, ItemA, ItemB>;
-    using Level = std::vector<Item>;
+    
+    #ifdef USE_MEM
+        using Alloc = std::allocator<Item>;
+    #else
+        using Alloc = NVM::allocator<Item>;
+    #endif
+    
+    using Level = std::vector<Item, Alloc>;
+    using MemLevel = std::vector<Item>;
 
     const uint8_t base;            ///< base^i is the maximum size of the ith level.
     const uint8_t min_level;       ///< Levels 0..min_level are combined into one large level.
@@ -70,8 +80,8 @@ class DynamicPGMIndex {
                         uint8_t target,
                         size_t size_hint,
                         typename Level::iterator insertion_point) {
-        Level tmp_a(size_hint + level(target).size());
-        Level tmp_b(size_hint + level(target).size());
+        MemLevel tmp_a(size_hint + level(target).size());
+        MemLevel tmp_b(size_hint + level(target).size());
 
         // Insert new_item in sorted order in the first level
         auto alternate = true;
@@ -104,8 +114,12 @@ class DynamicPGMIndex {
         }
 
         level(min_level).clear();
-        level(target) = std::move(alternate ? tmp_a : tmp_b);
+        // level(target) = std::move(alternate ? tmp_a : tmp_b);
+        level(target).assign(alternate ? tmp_a.begin() : tmp_b.begin(), 
+                                alternate ? tmp_a.end() : tmp_b.end());
         level(target).resize(tmp_size);
+
+        // NVM::Mem_persist(level(target).data(), sizeof(Item) * level(target).size());
 
         // Rebuild index, if needed
         if (has_pgm(target))
@@ -116,11 +130,13 @@ class DynamicPGMIndex {
         auto insertion_point = lower_bound_bl(level(min_level).begin(), level(min_level).end(), new_item);
         if (insertion_point != level(min_level).end() && *insertion_point == new_item) {
             *insertion_point = new_item;
+            // NVM::Mem_persist(insertion_point.base(), sizeof(Item));
             return;
         }
 
         if (level(min_level).size() < buffer_max_size) {
             level(min_level).insert(insertion_point, new_item);
+            // NVM::Mem_persist(insertion_point.base(), sizeof(Item) * (level(min_level).end() - insertion_point));
             used_levels = used_levels == min_level ? min_level + 1 : used_levels;
             return;
         }
@@ -245,26 +261,7 @@ public:
         std::cout << used_levels - min_level << std::endl;
     }
 
-    iterator find(const K &key) const {
-        for (auto i = min_level; i < used_levels; ++i) {
-            if (level(i).empty())
-                continue;
-
-            auto first = level(i).begin();
-            auto last = level(i).end();
-            if (has_pgm(i)) {
-                auto range = pgm(i).search(key);
-                first = level(i).begin() + range.lo;
-                last = level(i).begin() + range.hi;
-            }
-
-            auto it = lower_bound_bl(first, last, key);
-            if (it != level(i).end() && it->first == key)
-                return it->deleted() ? end() : iterator(this, i, it);
-        }
-
-        return end();
-    }
+    Iterator find(const K &key) const;
 
     /**
      * Returns a copy of the elements with key between and including @p lo and @p hi.
@@ -276,8 +273,8 @@ public:
         if (lo > hi)
             throw std::invalid_argument("lo > hi");
 
-        Level tmp_a;
-        Level tmp_b;
+        MemLevel tmp_a;
+        MemLevel tmp_b;
         auto alternate = true;
 
         for (auto i = min_level; i < used_levels; ++i) {
@@ -319,6 +316,7 @@ public:
         for (auto it = first; it != last; ++it)
             if (!it->deleted())
                 result.emplace_back(it->first, it->second);
+
         return result;
     }
 
@@ -468,6 +466,31 @@ private:
         return first + (*first < x);
     }
 };
+
+    template<typename K, typename V, typename PGMType>
+    typename DynamicPGMIndex<K, V, PGMType>::Iterator DynamicPGMIndex<K, V, PGMType>::find(const K &key) const {
+        for (auto i = min_level; i < used_levels; ++i) {
+            if (level(i).empty())
+                continue;
+
+            auto first = level(i).begin();
+            auto last = level(i).end();
+            
+            if (has_pgm(i)) {
+                auto range = pgm(i).search(key);
+                first = level(i).begin() + range.lo;
+                last = level(i).begin() + range.hi;
+            }
+
+            std::cout<< "level size: " << last - first << std::endl;
+
+            auto it = lower_bound_bl(first, last, key);
+            if (it != level(i).end() && it->first == key)
+                return it->deleted() ? end() : iterator(this, i, it);
+        }
+
+        return end();
+    }
 
 namespace internal {
 

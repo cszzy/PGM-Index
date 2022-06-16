@@ -1,0 +1,1804 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="646" onload="init(evt)" viewBox="0 0 1200 646" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				clearzoom();
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="646.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="629" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="629" > </text>
+<g id="frames">
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (8 samples, 0.02%)</title><rect x="1134.4" y="469" width="0.3" height="15.0" fill="rgb(214,50,20)" rx="2" ry="2" />
+<text  x="1137.45" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;unsigned long const*, std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt; &gt;::operator- (3 samples, 0.01%)</title><rect x="979.5" y="485" width="0.1" height="15.0" fill="rgb(242,143,23)" rx="2" ry="2" />
+<text  x="982.45" y="495.5" ></text>
+</g>
+<g >
+<title>intel_pmu_enable_all (7 samples, 0.02%)</title><rect x="964.8" y="309" width="0.3" height="15.0" fill="rgb(254,190,30)" rx="2" ry="2" />
+<text  x="967.83" y="319.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator* (15 samples, 0.05%)</title><rect x="977.1" y="485" width="0.6" height="15.0" fill="rgb(222,1,34)" rx="2" ry="2" />
+<text  x="980.13" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::begin (17 samples, 0.05%)</title><rect x="1115.8" y="517" width="0.6" height="15.0" fill="rgb(214,11,46)" rx="2" ry="2" />
+<text  x="1118.79" y="527.5" ></text>
+</g>
+<g >
+<title>ext4_dax_huge_fault (5 samples, 0.02%)</title><rect x="1166.0" y="245" width="0.2" height="15.0" fill="rgb(253,2,30)" rx="2" ry="2" />
+<text  x="1169.05" y="255.5" ></text>
+</g>
+<g >
+<title>operator new (22 samples, 0.07%)</title><rect x="1177.8" y="373" width="0.8" height="15.0" fill="rgb(236,224,4)" rx="2" ry="2" />
+<text  x="1180.85" y="383.5" ></text>
+</g>
+<g >
+<title>tick_sched_handle (5 samples, 0.02%)</title><rect x="964.4" y="389" width="0.2" height="15.0" fill="rgb(244,116,15)" rx="2" ry="2" />
+<text  x="967.40" y="399.5" ></text>
+</g>
+<g >
+<title>tick_sched_timer (13 samples, 0.04%)</title><rect x="964.1" y="405" width="0.5" height="15.0" fill="rgb(225,33,28)" rx="2" ry="2" />
+<text  x="967.12" y="415.5" ></text>
+</g>
+<g >
+<title>std::__distance&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (103 samples, 0.31%)</title><rect x="966.8" y="469" width="3.7" height="15.0" fill="rgb(226,14,26)" rx="2" ry="2" />
+<text  x="969.80" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator-&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (65 samples, 0.20%)</title><rect x="968.2" y="453" width="2.3" height="15.0" fill="rgb(239,42,51)" rx="2" ry="2" />
+<text  x="971.16" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (3 samples, 0.01%)</title><rect x="1182.4" y="469" width="0.1" height="15.0" fill="rgb(250,192,8)" rx="2" ry="2" />
+<text  x="1185.35" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_Temporary_value::~_Temporary_value (4 samples, 0.01%)</title><rect x="1187.6" y="469" width="0.1" height="15.0" fill="rgb(219,43,22)" rx="2" ry="2" />
+<text  x="1190.60" y="479.5" ></text>
+</g>
+<g >
+<title>__handle_mm_fault (5 samples, 0.02%)</title><rect x="1151.2" y="373" width="0.2" height="15.0" fill="rgb(219,138,46)" rx="2" ry="2" />
+<text  x="1154.18" y="383.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (15 samples, 0.05%)</title><rect x="28.2" y="501" width="0.5" height="15.0" fill="rgb(206,111,1)" rx="2" ry="2" />
+<text  x="31.20" y="511.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::begin (8 samples, 0.02%)</title><rect x="1187.7" y="469" width="0.3" height="15.0" fill="rgb(235,25,48)" rx="2" ry="2" />
+<text  x="1190.75" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator+ (6 samples, 0.02%)</title><rect x="1182.5" y="469" width="0.2" height="15.0" fill="rgb(208,173,13)" rx="2" ry="2" />
+<text  x="1185.46" y="479.5" ></text>
+</g>
+<g >
+<title>NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const&amp;&gt; (4 samples, 0.01%)</title><rect x="1187.3" y="421" width="0.2" height="15.0" fill="rgb(212,178,28)" rx="2" ry="2" />
+<text  x="1190.32" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator (19 samples, 0.06%)</title><rect x="26.8" y="517" width="0.7" height="15.0" fill="rgb(245,163,41)" rx="2" ry="2" />
+<text  x="29.84" y="527.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator (51 samples, 0.15%)</title><rect x="975.3" y="485" width="1.8" height="15.0" fill="rgb(240,199,35)" rx="2" ry="2" />
+<text  x="978.31" y="495.5" ></text>
+</g>
+<g >
+<title>main (33,003 samples, 99.98%)</title><rect x="10.1" y="549" width="1179.7" height="15.0" fill="rgb(246,219,41)" rx="2" ry="2" />
+<text  x="13.07" y="559.5" >main</text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::assign&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;, void&gt; (376 samples, 1.14%)</title><rect x="1154.0" y="469" width="13.4" height="15.0" fill="rgb(227,95,26)" rx="2" ry="2" />
+<text  x="1156.97" y="479.5" ></text>
+</g>
+<g >
+<title>__blkdev_issue_zero_pages (3 samples, 0.01%)</title><rect x="1166.0" y="133" width="0.2" height="15.0" fill="rgb(229,61,12)" rx="2" ry="2" />
+<text  x="1169.05" y="143.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::size (24 samples, 0.07%)</title><rect x="1044.3" y="453" width="0.9" height="15.0" fill="rgb(241,78,2)" rx="2" ry="2" />
+<text  x="1047.30" y="463.5" ></text>
+</g>
+<g >
+<title>ext4_iomap_begin (5 samples, 0.02%)</title><rect x="1166.0" y="197" width="0.2" height="15.0" fill="rgb(209,147,48)" rx="2" ry="2" />
+<text  x="1169.05" y="207.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (8 samples, 0.02%)</title><rect x="1148.9" y="437" width="0.2" height="15.0" fill="rgb(242,137,2)" rx="2" ry="2" />
+<text  x="1151.86" y="447.5" ></text>
+</g>
+<g >
+<title>operator new (11 samples, 0.03%)</title><rect x="1165.7" y="341" width="0.3" height="15.0" fill="rgb(251,83,49)" rx="2" ry="2" />
+<text  x="1168.66" y="351.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (3 samples, 0.01%)</title><rect x="1154.2" y="421" width="0.1" height="15.0" fill="rgb(212,119,7)" rx="2" ry="2" />
+<text  x="1157.22" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+= (3 samples, 0.01%)</title><rect x="1085.0" y="453" width="0.2" height="15.0" fill="rgb(252,42,14)" rx="2" ry="2" />
+<text  x="1088.05" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::begin (6 samples, 0.02%)</title><rect x="1181.1" y="485" width="0.2" height="15.0" fill="rgb(243,115,32)" rx="2" ry="2" />
+<text  x="1184.13" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::begin (114 samples, 0.35%)</title><rect x="1098.1" y="485" width="4.1" height="15.0" fill="rgb(214,160,28)" rx="2" ry="2" />
+<text  x="1101.10" y="495.5" ></text>
+</g>
+<g >
+<title>handle_mm_fault (5 samples, 0.02%)</title><rect x="1166.0" y="277" width="0.2" height="15.0" fill="rgb(215,82,18)" rx="2" ry="2" />
+<text  x="1169.05" y="287.5" ></text>
+</g>
+<g >
+<title>pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::height (30 samples, 0.09%)</title><rect x="1044.1" y="469" width="1.1" height="15.0" fill="rgb(233,29,3)" rx="2" ry="2" />
+<text  x="1047.08" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (7 samples, 0.02%)</title><rect x="1155.3" y="405" width="0.2" height="15.0" fill="rgb(244,185,5)" rx="2" ry="2" />
+<text  x="1158.29" y="415.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (34 samples, 0.10%)</title><rect x="1110.0" y="485" width="1.2" height="15.0" fill="rgb(211,60,45)" rx="2" ry="2" />
+<text  x="1113.03" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::~vector (41 samples, 0.12%)</title><rect x="32.1" y="501" width="1.4" height="15.0" fill="rgb(239,176,5)" rx="2" ry="2" />
+<text  x="35.06" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;unsigned long const*, std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt; &gt;::operator* (9 samples, 0.03%)</title><rect x="1037.5" y="469" width="0.3" height="15.0" fill="rgb(207,202,48)" rx="2" ry="2" />
+<text  x="1040.50" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (22 samples, 0.07%)</title><rect x="967.4" y="453" width="0.8" height="15.0" fill="rgb(253,3,47)" rx="2" ry="2" />
+<text  x="970.37" y="463.5" ></text>
+</g>
+<g >
+<title>NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (80 samples, 0.24%)</title><rect x="1163.6" y="357" width="2.9" height="15.0" fill="rgb(212,198,48)" rx="2" ry="2" />
+<text  x="1166.62" y="367.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+ (17 samples, 0.05%)</title><rect x="977.7" y="485" width="0.6" height="15.0" fill="rgb(235,35,14)" rx="2" ry="2" />
+<text  x="980.66" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (30 samples, 0.09%)</title><rect x="1142.6" y="453" width="1.1" height="15.0" fill="rgb(227,83,49)" rx="2" ry="2" />
+<text  x="1145.64" y="463.5" ></text>
+</g>
+<g >
+<title>operator new (13 samples, 0.04%)</title><rect x="1175.5" y="389" width="0.5" height="15.0" fill="rgb(241,5,18)" rx="2" ry="2" />
+<text  x="1178.49" y="399.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (140 samples, 0.42%)</title><rect x="1162.3" y="389" width="5.0" height="15.0" fill="rgb(205,85,0)" rx="2" ry="2" />
+<text  x="1165.26" y="399.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (53 samples, 0.16%)</title><rect x="1158.7" y="389" width="1.9" height="15.0" fill="rgb(205,173,41)" rx="2" ry="2" />
+<text  x="1161.72" y="399.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (17 samples, 0.05%)</title><rect x="1150.5" y="437" width="0.6" height="15.0" fill="rgb(210,97,34)" rx="2" ry="2" />
+<text  x="1153.54" y="447.5" ></text>
+</g>
+<g >
+<title>pgm::internal::LoserTree&lt;unsigned long&gt;::LoserTree (60 samples, 0.18%)</title><rect x="85.8" y="485" width="2.1" height="15.0" fill="rgb(250,183,51)" rx="2" ry="2" />
+<text  x="88.78" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Iterator (3 samples, 0.01%)</title><rect x="28.1" y="517" width="0.1" height="15.0" fill="rgb(208,82,8)" rx="2" ry="2" />
+<text  x="31.05" y="527.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt; &gt;::operator[] (15 samples, 0.05%)</title><rect x="971.4" y="485" width="0.5" height="15.0" fill="rgb(215,115,44)" rx="2" ry="2" />
+<text  x="974.41" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::clear (140 samples, 0.42%)</title><rect x="1167.4" y="469" width="5.0" height="15.0" fill="rgb(225,32,46)" rx="2" ry="2" />
+<text  x="1170.41" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (12 samples, 0.04%)</title><rect x="78.9" y="485" width="0.4" height="15.0" fill="rgb(213,148,17)" rx="2" ry="2" />
+<text  x="81.88" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::_Vector_impl_data::_Vector_impl_data (17 samples, 0.05%)</title><rect x="88.7" y="437" width="0.6" height="15.0" fill="rgb(217,194,53)" rx="2" ry="2" />
+<text  x="91.71" y="447.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::vector (48 samples, 0.15%)</title><rect x="86.2" y="469" width="1.7" height="15.0" fill="rgb(234,111,30)" rx="2" ry="2" />
+<text  x="89.21" y="479.5" ></text>
+</g>
+<g >
+<title>std::__advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (259 samples, 0.78%)</title><rect x="1065.3" y="437" width="9.3" height="15.0" fill="rgb(233,18,11)" rx="2" ry="2" />
+<text  x="1068.32" y="447.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (26 samples, 0.08%)</title><rect x="1169.2" y="421" width="0.9" height="15.0" fill="rgb(206,117,12)" rx="2" ry="2" />
+<text  x="1172.20" y="431.5" ></text>
+</g>
+<g >
+<title>std::forward&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (7 samples, 0.02%)</title><rect x="1166.2" y="341" width="0.3" height="15.0" fill="rgb(241,161,20)" rx="2" ry="2" />
+<text  x="1169.23" y="351.5" ></text>
+</g>
+<g >
+<title>submit_bio (3 samples, 0.01%)</title><rect x="1166.0" y="101" width="0.2" height="15.0" fill="rgb(221,165,19)" rx="2" ry="2" />
+<text  x="1169.05" y="111.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_destroy&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (8 samples, 0.02%)</title><rect x="1170.1" y="421" width="0.3" height="15.0" fill="rgb(208,12,25)" rx="2" ry="2" />
+<text  x="1173.12" y="431.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::begin (125 samples, 0.38%)</title><rect x="1087.4" y="501" width="4.5" height="15.0" fill="rgb(227,127,42)" rx="2" ry="2" />
+<text  x="1090.44" y="511.5" ></text>
+</g>
+<g >
+<title>std::move_backward&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*&gt; (58 samples, 0.18%)</title><rect x="1184.6" y="453" width="2.1" height="15.0" fill="rgb(241,101,17)" rx="2" ry="2" />
+<text  x="1187.60" y="463.5" ></text>
+</g>
+<g >
+<title>generic_make_request (3 samples, 0.01%)</title><rect x="1166.0" y="85" width="0.2" height="15.0" fill="rgb(243,10,5)" rx="2" ry="2" />
+<text  x="1169.05" y="95.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator (150 samples, 0.45%)</title><rect x="1023.7" y="469" width="5.4" height="15.0" fill="rgb(217,83,42)" rx="2" ry="2" />
+<text  x="1026.71" y="479.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (19 samples, 0.06%)</title><rect x="964.1" y="469" width="0.7" height="15.0" fill="rgb(224,224,28)" rx="2" ry="2" />
+<text  x="967.12" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::operator[] (21 samples, 0.06%)</title><rect x="1189.1" y="533" width="0.7" height="15.0" fill="rgb(235,20,33)" rx="2" ry="2" />
+<text  x="1192.07" y="543.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_default_n_1&lt;false&gt;::__uninit_default_n&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, unsigned long&gt; (216 samples, 0.65%)</title><rect x="1173.2" y="405" width="7.7" height="15.0" fill="rgb(217,78,14)" rx="2" ry="2" />
+<text  x="1176.16" y="415.5" ></text>
+</g>
+<g >
+<title>pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::search (3,201 samples, 9.70%)</title><rect x="972.0" y="501" width="114.4" height="15.0" fill="rgb(252,80,43)" rx="2" ry="2" />
+<text  x="974.98" y="511.5" >pgm::PGMIndex&lt;..</text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::~_Vector_base (33 samples, 0.10%)</title><rect x="30.7" y="469" width="1.2" height="15.0" fill="rgb(211,198,15)" rx="2" ry="2" />
+<text  x="33.73" y="479.5" ></text>
+</g>
+<g >
+<title>tick_do_update_jiffies64.part.0 (8 samples, 0.02%)</title><rect x="964.1" y="373" width="0.3" height="15.0" fill="rgb(242,104,29)" rx="2" ry="2" />
+<text  x="967.12" y="383.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (40 samples, 0.12%)</title><rect x="1145.8" y="453" width="1.4" height="15.0" fill="rgb(213,6,35)" rx="2" ry="2" />
+<text  x="1148.82" y="463.5" ></text>
+</g>
+<g >
+<title>irq_exit (3 samples, 0.01%)</title><rect x="964.7" y="437" width="0.1" height="15.0" fill="rgb(221,25,13)" rx="2" ry="2" />
+<text  x="967.65" y="447.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (16 samples, 0.05%)</title><rect x="1155.9" y="389" width="0.5" height="15.0" fill="rgb(243,25,22)" rx="2" ry="2" />
+<text  x="1158.86" y="399.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::__normal_iterator (43 samples, 0.13%)</title><rect x="1035.9" y="453" width="1.5" height="15.0" fill="rgb(222,29,16)" rx="2" ry="2" />
+<text  x="1038.90" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator++ (29 samples, 0.09%)</title><rect x="978.3" y="485" width="1.0" height="15.0" fill="rgb(237,27,49)" rx="2" ry="2" />
+<text  x="981.27" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::operator unsigned long (17 samples, 0.05%)</title><rect x="1136.3" y="469" width="0.7" height="15.0" fill="rgb(254,10,28)" rx="2" ry="2" />
+<text  x="1139.34" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator[] (4 samples, 0.01%)</title><rect x="1120.1" y="485" width="0.2" height="15.0" fill="rgb(235,75,15)" rx="2" ry="2" />
+<text  x="1123.12" y="495.5" ></text>
+</g>
+<g >
+<title>__do_page_fault (5 samples, 0.02%)</title><rect x="1151.2" y="421" width="0.2" height="15.0" fill="rgb(222,175,39)" rx="2" ry="2" />
+<text  x="1154.18" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (19 samples, 0.06%)</title><rect x="1147.2" y="453" width="0.7" height="15.0" fill="rgb(206,176,14)" rx="2" ry="2" />
+<text  x="1150.25" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_Temporary_value::_M_val (3 samples, 0.01%)</title><rect x="1186.7" y="469" width="0.2" height="15.0" fill="rgb(248,24,46)" rx="2" ry="2" />
+<text  x="1189.75" y="479.5" ></text>
+</g>
+<g >
+<title>NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;::destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (6 samples, 0.02%)</title><rect x="1171.8" y="389" width="0.3" height="15.0" fill="rgb(219,194,21)" rx="2" ry="2" />
+<text  x="1174.84" y="399.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (9 samples, 0.03%)</title><rect x="1094.6" y="485" width="0.3" height="15.0" fill="rgb(205,51,45)" rx="2" ry="2" />
+<text  x="1097.63" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_impl_data::_Vector_impl_data (11 samples, 0.03%)</title><rect x="86.9" y="421" width="0.4" height="15.0" fill="rgb(217,165,52)" rx="2" ry="2" />
+<text  x="89.89" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (20 samples, 0.06%)</title><rect x="43.2" y="501" width="0.8" height="15.0" fill="rgb(246,211,43)" rx="2" ry="2" />
+<text  x="46.24" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (22 samples, 0.07%)</title><rect x="1144.3" y="453" width="0.8" height="15.0" fill="rgb(206,42,14)" rx="2" ry="2" />
+<text  x="1147.32" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator+ (569 samples, 1.72%)</title><rect x="52.8" y="501" width="20.3" height="15.0" fill="rgb(210,166,32)" rx="2" ry="2" />
+<text  x="55.75" y="511.5" ></text>
+</g>
+<g >
+<title>pmem_do_bvec (3 samples, 0.01%)</title><rect x="1166.0" y="53" width="0.2" height="15.0" fill="rgb(247,218,27)" rx="2" ry="2" />
+<text  x="1169.05" y="63.5" ></text>
+</g>
+<g >
+<title>remote_function (7 samples, 0.02%)</title><rect x="964.8" y="405" width="0.3" height="15.0" fill="rgb(233,208,49)" rx="2" ry="2" />
+<text  x="967.83" y="415.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_copy_a&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; (61 samples, 0.18%)</title><rect x="1154.3" y="421" width="2.2" height="15.0" fill="rgb(245,38,18)" rx="2" ry="2" />
+<text  x="1157.32" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (10 samples, 0.03%)</title><rect x="1101.8" y="469" width="0.4" height="15.0" fill="rgb(248,43,15)" rx="2" ry="2" />
+<text  x="1104.81" y="479.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_M_get_Tp_allocator (4 samples, 0.01%)</title><rect x="30.6" y="469" width="0.1" height="15.0" fill="rgb(251,107,52)" rx="2" ry="2" />
+<text  x="33.55" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (5 samples, 0.02%)</title><rect x="1181.2" y="469" width="0.1" height="15.0" fill="rgb(247,141,41)" rx="2" ry="2" />
+<text  x="1184.17" y="479.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_default_n_a&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, unsigned long, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (236 samples, 0.71%)</title><rect x="1172.4" y="437" width="8.5" height="15.0" fill="rgb(232,45,27)" rx="2" ry="2" />
+<text  x="1175.45" y="447.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator (15 samples, 0.05%)</title><rect x="44.0" y="501" width="0.5" height="15.0" fill="rgb(252,122,3)" rx="2" ry="2" />
+<text  x="46.96" y="511.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_base (34 samples, 0.10%)</title><rect x="86.5" y="453" width="1.2" height="15.0" fill="rgb(205,197,0)" rx="2" ry="2" />
+<text  x="89.46" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator[] (8 samples, 0.02%)</title><rect x="1132.5" y="469" width="0.3" height="15.0" fill="rgb(251,188,22)" rx="2" ry="2" />
+<text  x="1135.52" y="479.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::insert_or_assign (1,986 samples, 6.02%)</title><rect x="1117.8" y="517" width="70.9" height="15.0" fill="rgb(221,186,35)" rx="2" ry="2" />
+<text  x="1120.76" y="527.5" >pgm::Dyn..</text>
+</g>
+<g >
+<title>microbench (33,010 samples, 100.00%)</title><rect x="10.0" y="581" width="1180.0" height="15.0" fill="rgb(249,121,45)" rx="2" ry="2" />
+<text  x="13.00" y="591.5" >microbench</text>
+</g>
+<g >
+<title>std::distance&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (139 samples, 0.42%)</title><rect x="965.7" y="485" width="4.9" height="15.0" fill="rgb(236,55,8)" rx="2" ry="2" />
+<text  x="968.65" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (8 samples, 0.02%)</title><rect x="27.7" y="517" width="0.3" height="15.0" fill="rgb(246,139,28)" rx="2" ry="2" />
+<text  x="30.73" y="527.5" ></text>
+</g>
+<g >
+<title>handle_mm_fault (5 samples, 0.02%)</title><rect x="1151.2" y="389" width="0.2" height="15.0" fill="rgb(216,41,16)" rx="2" ry="2" />
+<text  x="1154.18" y="399.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::operator unsigned long (17 samples, 0.05%)</title><rect x="1133.1" y="469" width="0.6" height="15.0" fill="rgb(228,206,44)" rx="2" ry="2" />
+<text  x="1136.06" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+= (163 samples, 0.49%)</title><rect x="1068.7" y="421" width="5.9" height="15.0" fill="rgb(253,213,23)" rx="2" ry="2" />
+<text  x="1071.75" y="431.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (12 samples, 0.04%)</title><rect x="1184.1" y="437" width="0.5" height="15.0" fill="rgb(224,65,22)" rx="2" ry="2" />
+<text  x="1187.14" y="447.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::end (25 samples, 0.08%)</title><rect x="1078.0" y="469" width="0.9" height="15.0" fill="rgb(244,221,39)" rx="2" ry="2" />
+<text  x="1081.04" y="479.5" ></text>
+</g>
+<g >
+<title>std::__copy_move_backward_a&lt;true, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*&gt; (45 samples, 0.14%)</title><rect x="1184.9" y="421" width="1.6" height="15.0" fill="rgb(213,179,39)" rx="2" ry="2" />
+<text  x="1187.92" y="431.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::pairwise_merge (1,313 samples, 3.98%)</title><rect x="1133.9" y="485" width="47.0" height="15.0" fill="rgb(220,36,47)" rx="2" ry="2" />
+<text  x="1136.95" y="495.5" >pgm:..</text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator[] (79 samples, 0.24%)</title><rect x="73.1" y="501" width="2.8" height="15.0" fill="rgb(250,185,3)" rx="2" ry="2" />
+<text  x="76.09" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (10 samples, 0.03%)</title><rect x="1118.8" y="485" width="0.3" height="15.0" fill="rgb(232,56,48)" rx="2" ry="2" />
+<text  x="1121.79" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;, std::allocator&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt;::operator[] (191 samples, 0.58%)</title><rect x="99.8" y="485" width="6.9" height="15.0" fill="rgb(225,145,38)" rx="2" ry="2" />
+<text  x="102.83" y="495.5" ></text>
+</g>
+<g >
+<title>task_tick_fair (4 samples, 0.01%)</title><rect x="964.4" y="341" width="0.1" height="15.0" fill="rgb(241,197,22)" rx="2" ry="2" />
+<text  x="967.40" y="351.5" ></text>
+</g>
+<g >
+<title>blkdev_issue_zeroout (5 samples, 0.02%)</title><rect x="1166.0" y="149" width="0.2" height="15.0" fill="rgb(225,163,3)" rx="2" ry="2" />
+<text  x="1169.05" y="159.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_Temporary_value::_Temporary_value&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const&amp;&gt; (21 samples, 0.06%)</title><rect x="1186.9" y="469" width="0.7" height="15.0" fill="rgb(235,202,44)" rx="2" ry="2" />
+<text  x="1189.85" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;, std::allocator&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt;::operator[] (35 samples, 0.11%)</title><rect x="1111.4" y="501" width="1.2" height="15.0" fill="rgb(212,24,22)" rx="2" ry="2" />
+<text  x="1114.39" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (3 samples, 0.01%)</title><rect x="1158.6" y="389" width="0.1" height="15.0" fill="rgb(240,43,38)" rx="2" ry="2" />
+<text  x="1161.61" y="399.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (834 samples, 2.53%)</title><rect x="384.7" y="469" width="29.8" height="15.0" fill="rgb(229,148,29)" rx="2" ry="2" />
+<text  x="387.70" y="479.5" >__..</text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (331 samples, 1.00%)</title><rect x="252.9" y="485" width="11.9" height="15.0" fill="rgb(226,196,48)" rx="2" ry="2" />
+<text  x="255.93" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_Temporary_value::~_Temporary_value (4 samples, 0.01%)</title><rect x="1181.0" y="485" width="0.1" height="15.0" fill="rgb(253,211,38)" rx="2" ry="2" />
+<text  x="1183.99" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (8 samples, 0.02%)</title><rect x="1158.3" y="389" width="0.3" height="15.0" fill="rgb(250,153,30)" rx="2" ry="2" />
+<text  x="1161.33" y="399.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::merge&lt;false, true, __gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;, __gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;, __gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (473 samples, 1.43%)</title><rect x="1137.0" y="469" width="16.9" height="15.0" fill="rgb(253,97,28)" rx="2" ry="2" />
+<text  x="1139.99" y="479.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (7 samples, 0.02%)</title><rect x="1162.0" y="389" width="0.3" height="15.0" fill="rgb(254,105,54)" rx="2" ry="2" />
+<text  x="1165.01" y="399.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::_M_deallocate (3 samples, 0.01%)</title><rect x="32.6" y="485" width="0.1" height="15.0" fill="rgb(212,26,38)" rx="2" ry="2" />
+<text  x="35.63" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (95 samples, 0.29%)</title><rect x="75.9" y="501" width="3.4" height="15.0" fill="rgb(217,26,20)" rx="2" ry="2" />
+<text  x="78.92" y="511.5" ></text>
+</g>
+<g >
+<title>std::__advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (18 samples, 0.05%)</title><rect x="1085.2" y="453" width="0.6" height="15.0" fill="rgb(240,186,29)" rx="2" ry="2" />
+<text  x="1088.15" y="463.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::_Vector_impl::_Vector_impl (32 samples, 0.10%)</title><rect x="88.4" y="453" width="1.1" height="15.0" fill="rgb(246,212,21)" rx="2" ry="2" />
+<text  x="91.36" y="463.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor*&gt; (5 samples, 0.02%)</title><rect x="32.4" y="469" width="0.2" height="15.0" fill="rgb(224,178,7)" rx="2" ry="2" />
+<text  x="35.38" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;unsigned long const*, std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt; &gt;::__normal_iterator (11 samples, 0.03%)</title><rect x="1038.7" y="453" width="0.4" height="15.0" fill="rgb(249,32,13)" rx="2" ry="2" />
+<text  x="1041.68" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::size (3 samples, 0.01%)</title><rect x="1188.2" y="485" width="0.1" height="15.0" fill="rgb(243,166,27)" rx="2" ry="2" />
+<text  x="1191.18" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (13 samples, 0.04%)</title><rect x="1127.3" y="469" width="0.4" height="15.0" fill="rgb(252,91,6)" rx="2" ry="2" />
+<text  x="1130.26" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::~vector (59 samples, 0.18%)</title><rect x="29.8" y="485" width="2.1" height="15.0" fill="rgb(250,157,6)" rx="2" ry="2" />
+<text  x="32.80" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::segment_for_key (2,786 samples, 8.44%)</title><rect x="981.1" y="485" width="99.6" height="15.0" fill="rgb(216,65,14)" rx="2" ry="2" />
+<text  x="984.10" y="495.5" >pgm::PGMInde..</text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (5 samples, 0.02%)</title><rect x="1156.7" y="405" width="0.2" height="15.0" fill="rgb(249,81,7)" rx="2" ry="2" />
+<text  x="1159.72" y="415.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_default_n&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, unsigned long&gt; (236 samples, 0.71%)</title><rect x="1172.4" y="421" width="8.5" height="15.0" fill="rgb(209,27,25)" rx="2" ry="2" />
+<text  x="1175.45" y="431.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (3 samples, 0.01%)</title><rect x="1161.9" y="389" width="0.1" height="15.0" fill="rgb(235,43,53)" rx="2" ry="2" />
+<text  x="1164.90" y="399.5" ></text>
+</g>
+<g >
+<title>std::min&lt;unsigned long&gt; (10 samples, 0.03%)</title><rect x="1081.6" y="485" width="0.3" height="15.0" fill="rgb(250,26,22)" rx="2" ry="2" />
+<text  x="1084.58" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment::operator (139 samples, 0.42%)</title><rect x="1039.1" y="469" width="5.0" height="15.0" fill="rgb(244,17,5)" rx="2" ry="2" />
+<text  x="1042.11" y="479.5" ></text>
+</g>
+<g >
+<title>std::advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (470 samples, 1.42%)</title><rect x="1058.6" y="453" width="16.8" height="15.0" fill="rgb(229,7,2)" rx="2" ry="2" />
+<text  x="1061.56" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::empty (366 samples, 1.11%)</title><rect x="1091.9" y="501" width="13.1" height="15.0" fill="rgb(250,84,6)" rx="2" ry="2" />
+<text  x="1094.91" y="511.5" ></text>
+</g>
+<g >
+<title>std::next&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt; &gt; (730 samples, 2.21%)</title><rect x="1049.3" y="469" width="26.1" height="15.0" fill="rgb(254,176,23)" rx="2" ry="2" />
+<text  x="1052.27" y="479.5" >s..</text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_M_erase_at_end (140 samples, 0.42%)</title><rect x="1167.4" y="453" width="5.0" height="15.0" fill="rgb(243,149,22)" rx="2" ry="2" />
+<text  x="1170.41" y="463.5" ></text>
+</g>
+<g >
+<title>all (33,010 samples, 100%)</title><rect x="10.0" y="597" width="1180.0" height="15.0" fill="rgb(238,222,37)" rx="2" ry="2" />
+<text  x="13.00" y="607.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+= (48 samples, 0.15%)</title><rect x="1063.6" y="437" width="1.7" height="15.0" fill="rgb(228,66,26)" rx="2" ry="2" />
+<text  x="1066.56" y="447.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::lower_bound_bl&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (8 samples, 0.02%)</title><rect x="1115.0" y="517" width="0.3" height="15.0" fill="rgb(234,168,16)" rx="2" ry="2" />
+<text  x="1117.97" y="527.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+ (123 samples, 0.37%)</title><rect x="1029.1" y="469" width="4.4" height="15.0" fill="rgb(218,53,6)" rx="2" ry="2" />
+<text  x="1032.10" y="479.5" ></text>
+</g>
+<g >
+<title>std::distance&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (7 samples, 0.02%)</title><rect x="1133.7" y="469" width="0.2" height="15.0" fill="rgb(239,138,4)" rx="2" ry="2" />
+<text  x="1136.70" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (10 samples, 0.03%)</title><rect x="1135.7" y="469" width="0.3" height="15.0" fill="rgb(227,128,32)" rx="2" ry="2" />
+<text  x="1138.66" y="479.5" ></text>
+</g>
+<g >
+<title>write_pmem (3 samples, 0.01%)</title><rect x="1166.0" y="37" width="0.2" height="15.0" fill="rgb(214,19,4)" rx="2" ry="2" />
+<text  x="1169.05" y="47.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_M_allocate_and_copy&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (304 samples, 0.92%)</title><rect x="1156.5" y="421" width="10.9" height="15.0" fill="rgb(228,174,53)" rx="2" ry="2" />
+<text  x="1159.54" y="431.5" ></text>
+</g>
+<g >
+<title>update_process_times (5 samples, 0.02%)</title><rect x="964.4" y="373" width="0.2" height="15.0" fill="rgb(236,100,3)" rx="2" ry="2" />
+<text  x="967.40" y="383.5" ></text>
+</g>
+<g >
+<title>__do_page_fault (5 samples, 0.02%)</title><rect x="1166.0" y="309" width="0.2" height="15.0" fill="rgb(231,152,5)" rx="2" ry="2" />
+<text  x="1169.05" y="319.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (14 samples, 0.04%)</title><rect x="1133.9" y="469" width="0.5" height="15.0" fill="rgb(244,110,31)" rx="2" ry="2" />
+<text  x="1136.95" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (12 samples, 0.04%)</title><rect x="72.6" y="485" width="0.4" height="15.0" fill="rgb(219,107,52)" rx="2" ry="2" />
+<text  x="75.56" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::__normal_iterator (26 samples, 0.08%)</title><rect x="1077.1" y="453" width="0.9" height="15.0" fill="rgb(229,105,1)" rx="2" ry="2" />
+<text  x="1080.11" y="463.5" ></text>
+</g>
+<g >
+<title>page_fault (5 samples, 0.02%)</title><rect x="1166.0" y="341" width="0.2" height="15.0" fill="rgb(227,94,44)" rx="2" ry="2" />
+<text  x="1169.05" y="351.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::vector (6 samples, 0.02%)</title><rect x="89.7" y="485" width="0.2" height="15.0" fill="rgb(235,145,4)" rx="2" ry="2" />
+<text  x="92.72" y="495.5" ></text>
+</g>
+<g >
+<title>std::move&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (3 samples, 0.01%)</title><rect x="1180.9" y="485" width="0.1" height="15.0" fill="rgb(239,188,40)" rx="2" ry="2" />
+<text  x="1183.88" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; (130 samples, 0.39%)</title><rect x="1167.4" y="437" width="4.7" height="15.0" fill="rgb(235,75,3)" rx="2" ry="2" />
+<text  x="1170.41" y="447.5" ></text>
+</g>
+<g >
+<title>std::__distance&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (3 samples, 0.01%)</title><rect x="1133.8" y="453" width="0.1" height="15.0" fill="rgb(228,179,41)" rx="2" ry="2" />
+<text  x="1136.81" y="463.5" ></text>
+</g>
+<g >
+<title>ext4_map_blocks (5 samples, 0.02%)</title><rect x="1166.0" y="181" width="0.2" height="15.0" fill="rgb(246,43,35)" rx="2" ry="2" />
+<text  x="1169.05" y="191.5" ></text>
+</g>
+<g >
+<title>pgm::internal::LoserTree&lt;unsigned long&gt;::~LoserTree (6 samples, 0.02%)</title><rect x="1115.6" y="517" width="0.2" height="15.0" fill="rgb(221,107,20)" rx="2" ry="2" />
+<text  x="1118.58" y="527.5" ></text>
+</g>
+<g >
+<title>smp_call_function_single_interrupt (7 samples, 0.02%)</title><rect x="964.8" y="453" width="0.3" height="15.0" fill="rgb(245,105,51)" rx="2" ry="2" />
+<text  x="967.83" y="463.5" ></text>
+</g>
+<g >
+<title>std::__iterator_category&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt; &gt; (3 samples, 0.01%)</title><rect x="1084.2" y="469" width="0.1" height="15.0" fill="rgb(243,1,15)" rx="2" ry="2" />
+<text  x="1087.19" y="479.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (3 samples, 0.01%)</title><rect x="1187.6" y="453" width="0.1" height="15.0" fill="rgb(207,20,6)" rx="2" ry="2" />
+<text  x="1190.64" y="463.5" ></text>
+</g>
+<g >
+<title>std::__advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (81 samples, 0.25%)</title><rect x="1054.2" y="453" width="2.9" height="15.0" fill="rgb(245,141,46)" rx="2" ry="2" />
+<text  x="1057.16" y="463.5" ></text>
+</g>
+<g >
+<title>operator new (3 samples, 0.01%)</title><rect x="1187.5" y="421" width="0.1" height="15.0" fill="rgb(228,0,3)" rx="2" ry="2" />
+<text  x="1190.46" y="431.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::operator[] (8 samples, 0.02%)</title><rect x="1086.1" y="485" width="0.3" height="15.0" fill="rgb(213,56,6)" rx="2" ry="2" />
+<text  x="1089.12" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt;::begin (7 samples, 0.02%)</title><rect x="1085.8" y="485" width="0.3" height="15.0" fill="rgb(236,145,33)" rx="2" ry="2" />
+<text  x="1088.83" y="495.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (5 samples, 0.02%)</title><rect x="1151.2" y="405" width="0.2" height="15.0" fill="rgb(212,35,19)" rx="2" ry="2" />
+<text  x="1154.18" y="415.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (14 samples, 0.04%)</title><rect x="969.9" y="437" width="0.5" height="15.0" fill="rgb(213,180,1)" rx="2" ry="2" />
+<text  x="972.94" y="447.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const&amp;&gt; (8 samples, 0.02%)</title><rect x="1187.3" y="437" width="0.3" height="15.0" fill="rgb(223,13,43)" rx="2" ry="2" />
+<text  x="1190.28" y="447.5" ></text>
+</g>
+<g >
+<title>__memcpy_avx_unaligned_erms (39 samples, 0.12%)</title><rect x="1185.1" y="405" width="1.4" height="15.0" fill="rgb(227,180,2)" rx="2" ry="2" />
+<text  x="1188.07" y="415.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::operator[] (5 samples, 0.02%)</title><rect x="1189.8" y="549" width="0.2" height="15.0" fill="rgb(206,21,31)" rx="2" ry="2" />
+<text  x="1192.82" y="559.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::insert (179 samples, 0.54%)</title><rect x="1181.8" y="485" width="6.4" height="15.0" fill="rgb(243,192,45)" rx="2" ry="2" />
+<text  x="1184.78" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (77 samples, 0.23%)</title><rect x="1176.5" y="389" width="2.7" height="15.0" fill="rgb(234,68,23)" rx="2" ry="2" />
+<text  x="1179.49" y="399.5" ></text>
+</g>
+<g >
+<title>dax_iomap_fault (5 samples, 0.02%)</title><rect x="1166.0" y="229" width="0.2" height="15.0" fill="rgb(233,56,28)" rx="2" ry="2" />
+<text  x="1169.05" y="239.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::level (417 samples, 1.26%)</title><rect x="91.8" y="501" width="14.9" height="15.0" fill="rgb(227,105,11)" rx="2" ry="2" />
+<text  x="94.75" y="511.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::end (11 samples, 0.03%)</title><rect x="1181.4" y="485" width="0.4" height="15.0" fill="rgb(221,104,29)" rx="2" ry="2" />
+<text  x="1184.39" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::~_Vector_base (17 samples, 0.05%)</title><rect x="32.9" y="485" width="0.6" height="15.0" fill="rgb(238,211,44)" rx="2" ry="2" />
+<text  x="35.91" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (23 samples, 0.07%)</title><rect x="1134.7" y="469" width="0.9" height="15.0" fill="rgb(252,207,10)" rx="2" ry="2" />
+<text  x="1137.74" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (24 samples, 0.07%)</title><rect x="42.4" y="501" width="0.8" height="15.0" fill="rgb(241,110,48)" rx="2" ry="2" />
+<text  x="45.39" y="511.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (46 samples, 0.14%)</title><rect x="1179.2" y="389" width="1.7" height="15.0" fill="rgb(210,69,18)" rx="2" ry="2" />
+<text  x="1182.24" y="399.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::has_pgm (9 samples, 0.03%)</title><rect x="1112.6" y="517" width="0.4" height="15.0" fill="rgb(244,165,47)" rx="2" ry="2" />
+<text  x="1115.64" y="527.5" ></text>
+</g>
+<g >
+<title>std::move&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (3 samples, 0.01%)</title><rect x="1153.8" y="453" width="0.1" height="15.0" fill="rgb(225,183,16)" rx="2" ry="2" />
+<text  x="1156.79" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (15 samples, 0.05%)</title><rect x="1097.6" y="469" width="0.5" height="15.0" fill="rgb(244,84,42)" rx="2" ry="2" />
+<text  x="1100.56" y="479.5" ></text>
+</g>
+<g >
+<title>dbInter::PGMDynamicDb::Put (1,987 samples, 6.02%)</title><rect x="1117.7" y="533" width="71.0" height="15.0" fill="rgb(249,174,14)" rx="2" ry="2" />
+<text  x="1120.72" y="543.5" >dbInter:..</text>
+</g>
+<g >
+<title>std::vector&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;, std::allocator&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt;::operator[] (8 samples, 0.02%)</title><rect x="1188.3" y="485" width="0.3" height="15.0" fill="rgb(231,47,25)" rx="2" ry="2" />
+<text  x="1191.28" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator+ (27 samples, 0.08%)</title><rect x="1119.1" y="485" width="1.0" height="15.0" fill="rgb(215,140,14)" rx="2" ry="2" />
+<text  x="1122.15" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::~Iterator (6 samples, 0.02%)</title><rect x="1188.8" y="533" width="0.2" height="15.0" fill="rgb(224,148,38)" rx="2" ry="2" />
+<text  x="1191.82" y="543.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (3 samples, 0.01%)</title><rect x="1187.9" y="453" width="0.1" height="15.0" fill="rgb(230,90,27)" rx="2" ry="2" />
+<text  x="1190.93" y="463.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::pgm (36 samples, 0.11%)</title><rect x="970.7" y="501" width="1.2" height="15.0" fill="rgb(244,208,34)" rx="2" ry="2" />
+<text  x="973.66" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (3 samples, 0.01%)</title><rect x="1135.6" y="469" width="0.1" height="15.0" fill="rgb(249,75,42)" rx="2" ry="2" />
+<text  x="1138.56" y="479.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (46 samples, 0.14%)</title><rect x="1170.4" y="421" width="1.7" height="15.0" fill="rgb(226,150,24)" rx="2" ry="2" />
+<text  x="1173.41" y="431.5" ></text>
+</g>
+<g >
+<title>std::__iterator_category&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt; &gt; (42 samples, 0.13%)</title><rect x="1057.1" y="453" width="1.5" height="15.0" fill="rgb(236,54,0)" rx="2" ry="2" />
+<text  x="1060.06" y="463.5" ></text>
+</g>
+<g >
+<title>operator new (5 samples, 0.02%)</title><rect x="1166.5" y="357" width="0.2" height="15.0" fill="rgb(253,220,37)" rx="2" ry="2" />
+<text  x="1169.48" y="367.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (4 samples, 0.01%)</title><rect x="1120.3" y="485" width="0.1" height="15.0" fill="rgb(248,2,30)" rx="2" ry="2" />
+<text  x="1123.26" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::~Iterator (136 samples, 0.41%)</title><rect x="28.7" y="517" width="4.9" height="15.0" fill="rgb(210,193,14)" rx="2" ry="2" />
+<text  x="31.73" y="527.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (19 samples, 0.06%)</title><rect x="964.1" y="453" width="0.7" height="15.0" fill="rgb(223,229,48)" rx="2" ry="2" />
+<text  x="967.12" y="463.5" ></text>
+</g>
+<g >
+<title>dbInter::PGMDynamicDb::Get (30,536 samples, 92.51%)</title><rect x="26.2" y="533" width="1091.5" height="15.0" fill="rgb(215,152,50)" rx="2" ry="2" />
+<text  x="29.16" y="543.5" >dbInter::PGMDynamicDb::Get</text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_M_insert_aux&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (91 samples, 0.28%)</title><rect x="1183.4" y="469" width="3.3" height="15.0" fill="rgb(206,153,40)" rx="2" ry="2" />
+<text  x="1186.42" y="479.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::_Vector_base (43 samples, 0.13%)</title><rect x="88.2" y="469" width="1.5" height="15.0" fill="rgb(250,111,42)" rx="2" ry="2" />
+<text  x="91.18" y="479.5" ></text>
+</g>
+<g >
+<title>std::__distance&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (15 samples, 0.05%)</title><rect x="965.1" y="485" width="0.5" height="15.0" fill="rgb(237,218,32)" rx="2" ry="2" />
+<text  x="968.08" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::operator unsigned long (15,172 samples, 45.96%)</title><rect x="422.7" y="485" width="542.4" height="15.0" fill="rgb(253,171,8)" rx="2" ry="2" />
+<text  x="425.73" y="495.5" >pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned ..</text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::has_pgm (51 samples, 0.15%)</title><rect x="89.9" y="501" width="1.9" height="15.0" fill="rgb(213,124,9)" rx="2" ry="2" />
+<text  x="92.93" y="511.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::cbegin (3 samples, 0.01%)</title><rect x="1188.0" y="469" width="0.1" height="15.0" fill="rgb(211,45,37)" rx="2" ry="2" />
+<text  x="1191.03" y="479.5" ></text>
+</g>
+<g >
+<title>page_fault (6 samples, 0.02%)</title><rect x="1151.1" y="453" width="0.3" height="15.0" fill="rgb(213,184,16)" rx="2" ry="2" />
+<text  x="1154.14" y="463.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_impl_data::_Vector_impl_data (4 samples, 0.01%)</title><rect x="87.5" y="437" width="0.1" height="15.0" fill="rgb(233,143,49)" rx="2" ry="2" />
+<text  x="90.46" y="447.5" ></text>
+</g>
+<g >
+<title>std::max&lt;unsigned long&gt; (3 samples, 0.01%)</title><rect x="1087.3" y="501" width="0.1" height="15.0" fill="rgb(219,26,22)" rx="2" ry="2" />
+<text  x="1090.30" y="511.5" ></text>
+</g>
+<g >
+<title>std::min&lt;unsigned long&gt; (23 samples, 0.07%)</title><rect x="1048.4" y="469" width="0.9" height="15.0" fill="rgb(240,131,54)" rx="2" ry="2" />
+<text  x="1051.44" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator-&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (11 samples, 0.03%)</title><rect x="966.4" y="469" width="0.4" height="15.0" fill="rgb(207,62,21)" rx="2" ry="2" />
+<text  x="969.40" y="479.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; (3 samples, 0.01%)</title><rect x="31.9" y="501" width="0.1" height="15.0" fill="rgb(232,108,13)" rx="2" ry="2" />
+<text  x="34.91" y="511.5" ></text>
+</g>
+<g >
+<title>pmem_make_request (3 samples, 0.01%)</title><rect x="1166.0" y="69" width="0.2" height="15.0" fill="rgb(227,226,38)" rx="2" ry="2" />
+<text  x="1169.05" y="79.5" ></text>
+</g>
+<g >
+<title>tick_sched_do_timer (8 samples, 0.02%)</title><rect x="964.1" y="389" width="0.3" height="15.0" fill="rgb(231,100,3)" rx="2" ry="2" />
+<text  x="967.12" y="399.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (13 samples, 0.04%)</title><rect x="1184.1" y="453" width="0.5" height="15.0" fill="rgb(215,66,41)" rx="2" ry="2" />
+<text  x="1187.10" y="463.5" ></text>
+</g>
+<g >
+<title>std::__iterator_category&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt; &gt; (22 samples, 0.07%)</title><rect x="1074.6" y="437" width="0.8" height="15.0" fill="rgb(239,15,23)" rx="2" ry="2" />
+<text  x="1077.57" y="447.5" ></text>
+</g>
+<g >
+<title>_raw_spin_lock_irqsave (4 samples, 0.01%)</title><rect x="964.2" y="325" width="0.2" height="15.0" fill="rgb(222,76,30)" rx="2" ry="2" />
+<text  x="967.22" y="335.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (25 samples, 0.08%)</title><rect x="1155.6" y="405" width="0.9" height="15.0" fill="rgb(219,179,45)" rx="2" ry="2" />
+<text  x="1158.61" y="415.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::pgm (8 samples, 0.02%)</title><rect x="1115.3" y="517" width="0.2" height="15.0" fill="rgb(217,191,44)" rx="2" ry="2" />
+<text  x="1118.25" y="527.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::level (56 samples, 0.17%)</title><rect x="1113.0" y="517" width="2.0" height="15.0" fill="rgb(253,56,6)" rx="2" ry="2" />
+<text  x="1115.97" y="527.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator==&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (53 samples, 0.16%)</title><rect x="420.7" y="485" width="1.9" height="15.0" fill="rgb(209,173,38)" rx="2" ry="2" />
+<text  x="423.73" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser*, pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; (3 samples, 0.01%)</title><rect x="30.4" y="469" width="0.1" height="15.0" fill="rgb(205,199,15)" rx="2" ry="2" />
+<text  x="33.38" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (29 samples, 0.09%)</title><rect x="1131.5" y="453" width="1.0" height="15.0" fill="rgb(232,144,31)" rx="2" ry="2" />
+<text  x="1134.48" y="463.5" ></text>
+</g>
+<g >
+<title>std::advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (5 samples, 0.02%)</title><rect x="1080.7" y="485" width="0.2" height="15.0" fill="rgb(212,45,27)" rx="2" ry="2" />
+<text  x="1083.69" y="495.5" ></text>
+</g>
+<g >
+<title>blk_next_bio (3 samples, 0.01%)</title><rect x="1166.0" y="117" width="0.2" height="15.0" fill="rgb(222,170,11)" rx="2" ry="2" />
+<text  x="1169.05" y="127.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::insert (1,971 samples, 5.97%)</title><rect x="1118.1" y="501" width="70.5" height="15.0" fill="rgb(215,29,49)" rx="2" ry="2" />
+<text  x="1121.11" y="511.5" >pgm::Dy..</text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const&amp;&gt; (10 samples, 0.03%)</title><rect x="1187.2" y="453" width="0.4" height="15.0" fill="rgb(208,218,42)" rx="2" ry="2" />
+<text  x="1190.21" y="463.5" ></text>
+</g>
+<g >
+<title>NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (6 samples, 0.02%)</title><rect x="1184.2" y="421" width="0.3" height="15.0" fill="rgb(221,221,47)" rx="2" ry="2" />
+<text  x="1187.24" y="431.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (7 samples, 0.02%)</title><rect x="964.8" y="325" width="0.3" height="15.0" fill="rgb(214,47,37)" rx="2" ry="2" />
+<text  x="967.83" y="335.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::_M_get_Tp_allocator (3 samples, 0.01%)</title><rect x="32.7" y="485" width="0.1" height="15.0" fill="rgb(212,47,45)" rx="2" ry="2" />
+<text  x="35.73" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::level (9 samples, 0.03%)</title><rect x="1120.8" y="485" width="0.3" height="15.0" fill="rgb(212,91,9)" rx="2" ry="2" />
+<text  x="1123.79" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (14 samples, 0.04%)</title><rect x="1104.5" y="469" width="0.5" height="15.0" fill="rgb(231,146,34)" rx="2" ry="2" />
+<text  x="1107.49" y="479.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_copy_a&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; (282 samples, 0.85%)</title><rect x="1157.3" y="405" width="10.0" height="15.0" fill="rgb(254,148,46)" rx="2" ry="2" />
+<text  x="1160.26" y="415.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt;::new_allocator (4 samples, 0.01%)</title><rect x="89.4" y="421" width="0.1" height="15.0" fill="rgb(207,125,48)" rx="2" ry="2" />
+<text  x="92.36" y="431.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::_Vector_base (3 samples, 0.01%)</title><rect x="87.9" y="485" width="0.1" height="15.0" fill="rgb(227,77,33)" rx="2" ry="2" />
+<text  x="90.93" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator==&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (88 samples, 0.27%)</title><rect x="1094.9" y="485" width="3.2" height="15.0" fill="rgb(232,149,16)" rx="2" ry="2" />
+<text  x="1097.95" y="495.5" ></text>
+</g>
+<g >
+<title>std::__copy_move_backward_a2&lt;true, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*&gt; (51 samples, 0.15%)</title><rect x="1184.7" y="437" width="1.9" height="15.0" fill="rgb(236,3,7)" rx="2" ry="2" />
+<text  x="1187.75" y="447.5" ></text>
+</g>
+<g >
+<title>generic_smp_call_function_single_interrupt (7 samples, 0.02%)</title><rect x="964.8" y="437" width="0.3" height="15.0" fill="rgb(231,208,39)" rx="2" ry="2" />
+<text  x="967.83" y="447.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_M_assign_aux&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (376 samples, 1.14%)</title><rect x="1154.0" y="437" width="13.4" height="15.0" fill="rgb(229,145,22)" rx="2" ry="2" />
+<text  x="1156.97" y="447.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::end (23 samples, 0.07%)</title><rect x="1116.8" y="517" width="0.8" height="15.0" fill="rgb(240,55,24)" rx="2" ry="2" />
+<text  x="1119.83" y="527.5" ></text>
+</g>
+<g >
+<title>std::next&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt; &gt; (109 samples, 0.33%)</title><rect x="1081.9" y="485" width="3.9" height="15.0" fill="rgb(213,72,10)" rx="2" ry="2" />
+<text  x="1084.94" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;unsigned long const*, std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt; &gt;::__normal_iterator (9 samples, 0.03%)</title><rect x="1078.6" y="453" width="0.3" height="15.0" fill="rgb(209,112,10)" rx="2" ry="2" />
+<text  x="1081.61" y="463.5" ></text>
+</g>
+<g >
+<title>event_function (7 samples, 0.02%)</title><rect x="964.8" y="389" width="0.3" height="15.0" fill="rgb(233,192,40)" rx="2" ry="2" />
+<text  x="967.83" y="399.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::operator unsigned long (89 samples, 0.27%)</title><rect x="81.0" y="501" width="3.1" height="15.0" fill="rgb(217,222,44)" rx="2" ry="2" />
+<text  x="83.96" y="511.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (7 samples, 0.02%)</title><rect x="964.8" y="341" width="0.3" height="15.0" fill="rgb(209,99,3)" rx="2" ry="2" />
+<text  x="967.83" y="351.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (17 samples, 0.05%)</title><rect x="1143.7" y="453" width="0.6" height="15.0" fill="rgb(250,130,14)" rx="2" ry="2" />
+<text  x="1146.71" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::vector (236 samples, 0.71%)</title><rect x="1172.4" y="469" width="8.5" height="15.0" fill="rgb(223,165,41)" rx="2" ry="2" />
+<text  x="1175.45" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator==&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (6 samples, 0.02%)</title><rect x="1132.8" y="469" width="0.2" height="15.0" fill="rgb(234,217,1)" rx="2" ry="2" />
+<text  x="1135.81" y="479.5" ></text>
+</g>
+<g >
+<title>std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt;::~allocator (3 samples, 0.01%)</title><rect x="31.8" y="437" width="0.1" height="15.0" fill="rgb(208,212,3)" rx="2" ry="2" />
+<text  x="34.77" y="447.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+ (43 samples, 0.13%)</title><rect x="1035.9" y="469" width="1.5" height="15.0" fill="rgb(252,43,33)" rx="2" ry="2" />
+<text  x="1038.90" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (5 samples, 0.02%)</title><rect x="1156.5" y="405" width="0.2" height="15.0" fill="rgb(209,162,48)" rx="2" ry="2" />
+<text  x="1159.54" y="415.5" ></text>
+</g>
+<g >
+<title>std::_Construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (11 samples, 0.03%)</title><rect x="1172.4" y="405" width="0.4" height="15.0" fill="rgb(232,134,8)" rx="2" ry="2" />
+<text  x="1175.45" y="415.5" ></text>
+</g>
+<g >
+<title>flush_smp_call_function_queue (7 samples, 0.02%)</title><rect x="964.8" y="421" width="0.3" height="15.0" fill="rgb(244,24,16)" rx="2" ry="2" />
+<text  x="967.83" y="431.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::operator[] (49 samples, 0.15%)</title><rect x="1078.9" y="469" width="1.8" height="15.0" fill="rgb(227,115,22)" rx="2" ry="2" />
+<text  x="1081.93" y="479.5" ></text>
+</g>
+<g >
+<title>std::_Destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; (7 samples, 0.02%)</title><rect x="32.3" y="485" width="0.3" height="15.0" fill="rgb(219,164,18)" rx="2" ry="2" />
+<text  x="35.34" y="495.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (5 samples, 0.02%)</title><rect x="1172.2" y="437" width="0.2" height="15.0" fill="rgb(207,124,9)" rx="2" ry="2" />
+<text  x="1175.23" y="447.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_base (9 samples, 0.03%)</title><rect x="85.9" y="469" width="0.3" height="15.0" fill="rgb(234,190,21)" rx="2" ry="2" />
+<text  x="88.89" y="479.5" ></text>
+</g>
+<g >
+<title>std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt;::allocator (4 samples, 0.01%)</title><rect x="89.6" y="453" width="0.1" height="15.0" fill="rgb(252,130,22)" rx="2" ry="2" />
+<text  x="92.57" y="463.5" ></text>
+</g>
+<g >
+<title>std::distance&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (20 samples, 0.06%)</title><rect x="1086.6" y="501" width="0.7" height="15.0" fill="rgb(222,202,18)" rx="2" ry="2" />
+<text  x="1089.58" y="511.5" ></text>
+</g>
+<g >
+<title>std::advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (92 samples, 0.28%)</title><rect x="1045.2" y="469" width="3.2" height="15.0" fill="rgb(205,98,16)" rx="2" ry="2" />
+<text  x="1048.15" y="479.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_impl::_Vector_impl (7 samples, 0.02%)</title><rect x="87.7" y="453" width="0.2" height="15.0" fill="rgb(207,178,14)" rx="2" ry="2" />
+<text  x="90.68" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator+ (5 samples, 0.02%)</title><rect x="27.6" y="517" width="0.1" height="15.0" fill="rgb(245,216,40)" rx="2" ry="2" />
+<text  x="30.55" y="527.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (231 samples, 0.70%)</title><rect x="44.5" y="501" width="8.3" height="15.0" fill="rgb(213,174,25)" rx="2" ry="2" />
+<text  x="47.50" y="511.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_impl::_Vector_impl (25 samples, 0.08%)</title><rect x="86.6" y="437" width="0.9" height="15.0" fill="rgb(250,223,9)" rx="2" ry="2" />
+<text  x="89.57" y="447.5" ></text>
+</g>
+<g >
+<title>NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;::construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (12 samples, 0.04%)</title><rect x="1155.9" y="373" width="0.4" height="15.0" fill="rgb(217,31,14)" rx="2" ry="2" />
+<text  x="1158.90" y="383.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;, std::allocator&lt;std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt;::operator[] (5 samples, 0.02%)</title><rect x="1120.9" y="469" width="0.2" height="15.0" fill="rgb(241,228,45)" rx="2" ry="2" />
+<text  x="1123.94" y="479.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::lower_bound_bl&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (24,170 samples, 73.22%)</title><rect x="106.7" y="501" width="864.0" height="15.0" fill="rgb(253,164,39)" rx="2" ry="2" />
+<text  x="109.66" y="511.5" >pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::lower_bound_bl&lt;__gnu..</text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (15 samples, 0.05%)</title><rect x="422.1" y="469" width="0.5" height="15.0" fill="rgb(209,222,28)" rx="2" ry="2" />
+<text  x="425.09" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (17 samples, 0.05%)</title><rect x="264.8" y="485" width="0.6" height="15.0" fill="rgb(228,127,4)" rx="2" ry="2" />
+<text  x="267.77" y="495.5" ></text>
+</g>
+<g >
+<title>std::_Vector_base&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser, std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt; &gt;::_Vector_impl::~_Vector_impl (5 samples, 0.02%)</title><rect x="31.7" y="453" width="0.2" height="15.0" fill="rgb(229,70,4)" rx="2" ry="2" />
+<text  x="34.70" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::end (79 samples, 0.24%)</title><rect x="1102.2" y="485" width="2.8" height="15.0" fill="rgb(223,89,49)" rx="2" ry="2" />
+<text  x="1105.17" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::operator unsigned long (68 samples, 0.21%)</title><rect x="1151.4" y="453" width="2.4" height="15.0" fill="rgb(209,167,5)" rx="2" ry="2" />
+<text  x="1154.36" y="463.5" ></text>
+</g>
+<g >
+<title>native_write_msr (7 samples, 0.02%)</title><rect x="964.8" y="293" width="0.3" height="15.0" fill="rgb(240,163,19)" rx="2" ry="2" />
+<text  x="967.83" y="303.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;unsigned long const*, std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt; &gt;::operator- (35 samples, 0.11%)</title><rect x="1037.8" y="469" width="1.3" height="15.0" fill="rgb(250,131,43)" rx="2" ry="2" />
+<text  x="1040.83" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (7 samples, 0.02%)</title><rect x="1127.0" y="469" width="0.3" height="15.0" fill="rgb(241,209,32)" rx="2" ry="2" />
+<text  x="1130.01" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator++ (67 samples, 0.20%)</title><rect x="1033.5" y="469" width="2.4" height="15.0" fill="rgb(249,19,39)" rx="2" ry="2" />
+<text  x="1036.50" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_M_assign_dispatch&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (376 samples, 1.14%)</title><rect x="1154.0" y="453" width="13.4" height="15.0" fill="rgb(227,211,2)" rx="2" ry="2" />
+<text  x="1156.97" y="463.5" ></text>
+</g>
+<g >
+<title>NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;::destroy&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (5 samples, 0.02%)</title><rect x="1171.1" y="405" width="0.1" height="15.0" fill="rgb(237,166,39)" rx="2" ry="2" />
+<text  x="1174.05" y="415.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (18 samples, 0.05%)</title><rect x="1091.3" y="485" width="0.6" height="15.0" fill="rgb(218,8,36)" rx="2" ry="2" />
+<text  x="1094.27" y="495.5" ></text>
+</g>
+<g >
+<title>update_wall_time (8 samples, 0.02%)</title><rect x="964.1" y="357" width="0.3" height="15.0" fill="rgb(213,157,42)" rx="2" ry="2" />
+<text  x="967.12" y="367.5" ></text>
+</g>
+<g >
+<title>std::__iterator_category&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (4 samples, 0.01%)</title><rect x="970.5" y="469" width="0.1" height="15.0" fill="rgb(240,216,22)" rx="2" ry="2" />
+<text  x="973.48" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_M_default_initialize (236 samples, 0.71%)</title><rect x="1172.4" y="453" width="8.5" height="15.0" fill="rgb(227,129,35)" rx="2" ry="2" />
+<text  x="1175.45" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt;::new_allocator (4 samples, 0.01%)</title><rect x="86.7" y="421" width="0.2" height="15.0" fill="rgb(208,101,32)" rx="2" ry="2" />
+<text  x="89.75" y="431.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt;::begin (75 samples, 0.23%)</title><rect x="1075.4" y="469" width="2.6" height="15.0" fill="rgb(219,9,9)" rx="2" ry="2" />
+<text  x="1078.36" y="479.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (13 samples, 0.04%)</title><rect x="964.1" y="421" width="0.5" height="15.0" fill="rgb(246,138,33)" rx="2" ry="2" />
+<text  x="967.12" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (18 samples, 0.05%)</title><rect x="1154.6" y="405" width="0.7" height="15.0" fill="rgb(233,107,19)" rx="2" ry="2" />
+<text  x="1157.65" y="415.5" ></text>
+</g>
+<g >
+<title>call_function_single_interrupt (7 samples, 0.02%)</title><rect x="964.8" y="469" width="0.3" height="15.0" fill="rgb(214,44,41)" rx="2" ry="2" />
+<text  x="967.83" y="479.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::ItemA (3 samples, 0.01%)</title><rect x="1118.0" y="501" width="0.1" height="15.0" fill="rgb(238,121,34)" rx="2" ry="2" />
+<text  x="1121.01" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::__normal_iterator (18 samples, 0.05%)</title><rect x="1023.1" y="469" width="0.6" height="15.0" fill="rgb(226,115,17)" rx="2" ry="2" />
+<text  x="1026.06" y="479.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::deleted (23 samples, 0.07%)</title><rect x="80.1" y="501" width="0.9" height="15.0" fill="rgb(213,33,15)" rx="2" ry="2" />
+<text  x="83.14" y="511.5" ></text>
+</g>
+<g >
+<title>timekeeping_advance (8 samples, 0.02%)</title><rect x="964.1" y="341" width="0.3" height="15.0" fill="rgb(246,154,25)" rx="2" ry="2" />
+<text  x="967.12" y="351.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (56 samples, 0.17%)</title><rect x="1149.1" y="453" width="2.0" height="15.0" fill="rgb(218,102,1)" rx="2" ry="2" />
+<text  x="1152.14" y="463.5" ></text>
+</g>
+<g >
+<title>scheduler_tick (5 samples, 0.02%)</title><rect x="964.4" y="357" width="0.2" height="15.0" fill="rgb(207,146,10)" rx="2" ry="2" />
+<text  x="967.40" y="367.5" ></text>
+</g>
+<g >
+<title>std::forward&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (10 samples, 0.03%)</title><rect x="1166.9" y="373" width="0.4" height="15.0" fill="rgb(240,27,18)" rx="2" ry="2" />
+<text  x="1169.91" y="383.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::lower_bound_bl&lt;__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; &gt; (359 samples, 1.09%)</title><rect x="1121.1" y="485" width="12.8" height="15.0" fill="rgb(205,94,28)" rx="2" ry="2" />
+<text  x="1124.12" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator[] (171 samples, 0.52%)</title><rect x="414.6" y="485" width="6.1" height="15.0" fill="rgb(229,151,29)" rx="2" ry="2" />
+<text  x="417.62" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator-&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (3 samples, 0.01%)</title><rect x="1182.7" y="469" width="0.1" height="15.0" fill="rgb(242,41,25)" rx="2" ry="2" />
+<text  x="1185.67" y="479.5" ></text>
+</g>
+<g >
+<title>__perf_event_enable (7 samples, 0.02%)</title><rect x="964.8" y="373" width="0.3" height="15.0" fill="rgb(208,49,51)" rx="2" ry="2" />
+<text  x="967.83" y="383.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (5 samples, 0.02%)</title><rect x="1166.0" y="293" width="0.2" height="15.0" fill="rgb(210,67,0)" rx="2" ry="2" />
+<text  x="1169.05" y="303.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (9 samples, 0.03%)</title><rect x="1136.0" y="469" width="0.3" height="15.0" fill="rgb(209,4,34)" rx="2" ry="2" />
+<text  x="1139.02" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator+ (3,527 samples, 10.68%)</title><rect x="288.5" y="485" width="126.1" height="15.0" fill="rgb(238,142,3)" rx="2" ry="2" />
+<text  x="291.54" y="495.5" >__gnu_cxx::__no..</text>
+</g>
+<g >
+<title>hrtimer_interrupt (15 samples, 0.05%)</title><rect x="964.1" y="437" width="0.6" height="15.0" fill="rgb(208,45,4)" rx="2" ry="2" />
+<text  x="967.12" y="447.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 samples, 0.02%)</title><rect x="1166.0" y="325" width="0.2" height="15.0" fill="rgb(211,151,9)" rx="2" ry="2" />
+<text  x="1169.05" y="335.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (9 samples, 0.03%)</title><rect x="1172.8" y="405" width="0.4" height="15.0" fill="rgb(252,65,32)" rx="2" ry="2" />
+<text  x="1175.84" y="415.5" ></text>
+</g>
+<g >
+<title>pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment::operator (42 samples, 0.13%)</title><rect x="979.6" y="485" width="1.5" height="15.0" fill="rgb(253,98,42)" rx="2" ry="2" />
+<text  x="982.56" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::ItemA (15 samples, 0.05%)</title><rect x="1176.0" y="389" width="0.5" height="15.0" fill="rgb(252,21,36)" rx="2" ry="2" />
+<text  x="1178.95" y="399.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 samples, 0.02%)</title><rect x="1151.2" y="437" width="0.2" height="15.0" fill="rgb(214,43,37)" rx="2" ry="2" />
+<text  x="1154.18" y="447.5" ></text>
+</g>
+<g >
+<title>std::advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (43 samples, 0.13%)</title><rect x="1084.3" y="469" width="1.5" height="15.0" fill="rgb(223,59,45)" rx="2" ry="2" />
+<text  x="1087.30" y="479.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator==&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (23 samples, 0.07%)</title><rect x="79.3" y="501" width="0.8" height="15.0" fill="rgb(235,219,47)" rx="2" ry="2" />
+<text  x="82.31" y="511.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (3 samples, 0.01%)</title><rect x="1157.1" y="405" width="0.2" height="15.0" fill="rgb(219,123,32)" rx="2" ry="2" />
+<text  x="1160.15" y="415.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::ItemA (17 samples, 0.05%)</title><rect x="1178.6" y="373" width="0.6" height="15.0" fill="rgb(235,137,11)" rx="2" ry="2" />
+<text  x="1181.63" y="383.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator++ (3 samples, 0.01%)</title><rect x="1154.0" y="421" width="0.1" height="15.0" fill="rgb(209,214,47)" rx="2" ry="2" />
+<text  x="1157.04" y="431.5" ></text>
+</g>
+<g >
+<title>__softirqentry_text_start (3 samples, 0.01%)</title><rect x="964.7" y="421" width="0.1" height="15.0" fill="rgb(222,189,40)" rx="2" ry="2" />
+<text  x="967.65" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (20 samples, 0.06%)</title><rect x="1145.1" y="453" width="0.7" height="15.0" fill="rgb(217,168,35)" rx="2" ry="2" />
+<text  x="1148.10" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (7 samples, 0.02%)</title><rect x="1156.9" y="405" width="0.2" height="15.0" fill="rgb(250,213,15)" rx="2" ry="2" />
+<text  x="1159.90" y="415.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::base (10 samples, 0.03%)</title><rect x="1161.5" y="373" width="0.4" height="15.0" fill="rgb(252,215,27)" rx="2" ry="2" />
+<text  x="1164.51" y="383.5" ></text>
+</g>
+<g >
+<title>std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt;::allocator (5 samples, 0.02%)</title><rect x="89.3" y="437" width="0.2" height="15.0" fill="rgb(235,91,53)" rx="2" ry="2" />
+<text  x="92.32" y="447.5" ></text>
+</g>
+<g >
+<title>std::max&lt;unsigned long&gt; (20 samples, 0.06%)</title><rect x="1080.9" y="485" width="0.7" height="15.0" fill="rgb(235,45,24)" rx="2" ry="2" />
+<text  x="1083.87" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator* (648 samples, 1.96%)</title><rect x="265.4" y="485" width="23.1" height="15.0" fill="rgb(209,141,24)" rx="2" ry="2" />
+<text  x="268.37" y="495.5" >_..</text>
+</g>
+<g >
+<title>pgm::internal::LoserTree&lt;unsigned long&gt;::~LoserTree (75 samples, 0.23%)</title><rect x="29.2" y="501" width="2.7" height="15.0" fill="rgb(221,121,36)" rx="2" ry="2" />
+<text  x="32.23" y="511.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor&gt; &gt;::vector (47 samples, 0.14%)</title><rect x="88.0" y="485" width="1.7" height="15.0" fill="rgb(245,218,0)" rx="2" ry="2" />
+<text  x="91.04" y="495.5" ></text>
+</g>
+<g >
+<title>std::allocator&lt;pgm::internal::LoserTree&lt;unsigned long&gt;::Loser&gt;::allocator (5 samples, 0.02%)</title><rect x="87.3" y="421" width="0.2" height="15.0" fill="rgb(232,157,46)" rx="2" ry="2" />
+<text  x="90.28" y="431.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, std::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (36 samples, 0.11%)</title><rect x="1160.6" y="389" width="1.3" height="15.0" fill="rgb(218,73,50)" rx="2" ry="2" />
+<text  x="1163.62" y="399.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::operator (16 samples, 0.05%)</title><rect x="28.2" y="517" width="0.5" height="15.0" fill="rgb(224,151,19)" rx="2" ry="2" />
+<text  x="31.16" y="527.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_construct&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (108 samples, 0.33%)</title><rect x="1163.0" y="373" width="3.9" height="15.0" fill="rgb(221,119,8)" rx="2" ry="2" />
+<text  x="1166.05" y="383.5" ></text>
+</g>
+<g >
+<title>pgm::internal::LoserTree&lt;unsigned long&gt;::LoserTree (3 samples, 0.01%)</title><rect x="1086.5" y="501" width="0.1" height="15.0" fill="rgb(248,105,3)" rx="2" ry="2" />
+<text  x="1089.48" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;::operator+= (15 samples, 0.05%)</title><rect x="1085.3" y="437" width="0.5" height="15.0" fill="rgb(208,198,12)" rx="2" ry="2" />
+<text  x="1088.26" y="447.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::operator+ (134 samples, 0.41%)</title><rect x="1127.7" y="469" width="4.8" height="15.0" fill="rgb(235,129,16)" rx="2" ry="2" />
+<text  x="1130.73" y="479.5" ></text>
+</g>
+<g >
+<title>std::forward&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (3 samples, 0.01%)</title><rect x="1184.4" y="405" width="0.1" height="15.0" fill="rgb(250,86,20)" rx="2" ry="2" />
+<text  x="1187.35" y="415.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::find (30,186 samples, 91.45%)</title><rect x="33.6" y="517" width="1079.0" height="15.0" fill="rgb(233,81,40)" rx="2" ry="2" />
+<text  x="36.59" y="527.5" >pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::find</text>
+</g>
+<g >
+<title>dax_iomap_pmd_fault.isra.0 (5 samples, 0.02%)</title><rect x="1166.0" y="213" width="0.2" height="15.0" fill="rgb(246,51,42)" rx="2" ry="2" />
+<text  x="1169.05" y="223.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator-&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (6 samples, 0.02%)</title><rect x="1182.8" y="469" width="0.2" height="15.0" fill="rgb(246,100,9)" rx="2" ry="2" />
+<text  x="1185.78" y="479.5" ></text>
+</g>
+<g >
+<title>std::__addressof&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (5 samples, 0.02%)</title><rect x="1172.1" y="437" width="0.1" height="15.0" fill="rgb(241,13,6)" rx="2" ry="2" />
+<text  x="1175.06" y="447.5" ></text>
+</g>
+<g >
+<title>std::forward&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&amp;&gt; (7 samples, 0.02%)</title><rect x="1166.7" y="357" width="0.2" height="15.0" fill="rgb(234,127,11)" rx="2" ry="2" />
+<text  x="1169.66" y="367.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (8 samples, 0.02%)</title><rect x="1181.5" y="469" width="0.3" height="15.0" fill="rgb(209,8,20)" rx="2" ry="2" />
+<text  x="1184.49" y="479.5" ></text>
+</g>
+<g >
+<title>ext4_issue_zeroout (5 samples, 0.02%)</title><rect x="1166.0" y="165" width="0.2" height="15.0" fill="rgb(224,164,46)" rx="2" ry="2" />
+<text  x="1169.05" y="175.5" ></text>
+</g>
+<g >
+<title>std::__advance&lt;__gnu_cxx::__normal_iterator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment const*, std::vector&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, NVM::ComonAllocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment, std::allocator&lt;pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt;::Segment&gt; &gt; &gt; &gt;, long&gt; (3 samples, 0.01%)</title><rect x="1084.1" y="469" width="0.1" height="15.0" fill="rgb(211,94,4)" rx="2" ry="2" />
+<text  x="1087.08" y="479.5" ></text>
+</g>
+<g >
+<title>__handle_mm_fault (5 samples, 0.02%)</title><rect x="1166.0" y="261" width="0.2" height="15.0" fill="rgb(207,2,45)" rx="2" ry="2" />
+<text  x="1169.05" y="271.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::empty (12 samples, 0.04%)</title><rect x="1116.4" y="517" width="0.4" height="15.0" fill="rgb(233,158,13)" rx="2" ry="2" />
+<text  x="1119.40" y="527.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::end (176 samples, 0.53%)</title><rect x="1105.0" y="501" width="6.3" height="15.0" fill="rgb(216,90,43)" rx="2" ry="2" />
+<text  x="1107.99" y="511.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;unsigned long const*, std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt; &gt;::operator* (4 samples, 0.01%)</title><rect x="979.3" y="485" width="0.2" height="15.0" fill="rgb(252,2,30)" rx="2" ry="2" />
+<text  x="982.31" y="495.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Cursor::Cursor (11 samples, 0.03%)</title><rect x="85.4" y="485" width="0.4" height="15.0" fill="rgb(233,0,49)" rx="2" ry="2" />
+<text  x="88.39" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt;::__normal_iterator (19 samples, 0.06%)</title><rect x="1093.9" y="485" width="0.7" height="15.0" fill="rgb(253,15,27)" rx="2" ry="2" />
+<text  x="1096.95" y="495.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (33,009 samples, 100.00%)</title><rect x="10.0" y="565" width="1180.0" height="15.0" fill="rgb(209,147,32)" rx="2" ry="2" />
+<text  x="13.04" y="575.5" >__libc_start_main</text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA::operator unsigned long (9 samples, 0.03%)</title><rect x="1120.5" y="485" width="0.3" height="15.0" fill="rgb(245,45,23)" rx="2" ry="2" />
+<text  x="1123.47" y="495.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator==&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA const*, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (9 samples, 0.03%)</title><rect x="1183.0" y="469" width="0.3" height="15.0" fill="rgb(211,203,44)" rx="2" ry="2" />
+<text  x="1185.99" y="479.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt;::_S_destroy&lt;NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt;, pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; (23 samples, 0.07%)</title><rect x="1171.2" y="405" width="0.9" height="15.0" fill="rgb(210,119,43)" rx="2" ry="2" />
+<text  x="1174.23" y="415.5" ></text>
+</g>
+<g >
+<title>ctx_resched (7 samples, 0.02%)</title><rect x="964.8" y="357" width="0.3" height="15.0" fill="rgb(213,131,42)" rx="2" ry="2" />
+<text  x="967.83" y="367.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA*, std::vector&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA, NVM::allocator&lt;pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::ItemA&gt; &gt; &gt; (34 samples, 0.10%)</title><rect x="1147.9" y="453" width="1.2" height="15.0" fill="rgb(221,107,40)" rx="2" ry="2" />
+<text  x="1150.93" y="463.5" ></text>
+</g>
+<g >
+<title>pgm::DynamicPGMIndex&lt;unsigned long, unsigned long, pgm::PGMIndex&lt;unsigned long, 4ul, 4ul, float&gt; &gt;::Iterator::Iterator (160 samples, 0.48%)</title><rect x="84.2" y="501" width="5.7" height="15.0" fill="rgb(247,186,34)" rx="2" ry="2" />
+<text  x="87.21" y="511.5" ></text>
+</g>
+</g>
+</svg>

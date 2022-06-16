@@ -378,7 +378,9 @@ protected:
     size_t n;                                     ///< The number of elements this index was built on.
     K first_key;                                  ///< The smallest element.
     K last_key;                                   ///< The largest element.
-    std::vector<Segment> segments;                ///< The segments composing the index.
+    // std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> segments;                ///< The segments composing the index.
+
+    std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> segments;
     sdsl::int_vector<TopLevelBitSize> top_level;  ///< The structure on the segment.
     K step;
 
@@ -563,7 +565,9 @@ public:
         if (n == 0)
             return;
 
-        std::vector<Segment> tmp;
+        // std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> tmp;
+
+        std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> tmp;
         std::vector<size_t> offsets;
         PGMIndex<K, Epsilon, 0, Floating>::build(first, last, Epsilon, 0, tmp, offsets);
 

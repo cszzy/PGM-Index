@@ -25,6 +25,8 @@
 #include <utility>
 #include <vector>
 
+#include "nvm_alloc.h"
+
 namespace pgm {
 
 #define PGM_SUB_EPS(x, epsilon) ((x) <= (epsilon) ? 0 : ((x) - (epsilon)))
@@ -71,17 +73,20 @@ protected:
     friend class EliasFanoPGMIndex;
 
     static_assert(Epsilon > 0);
+
     struct Segment;
 
     size_t n;                           ///< The number of elements this index was built on.
     K first_key;                        ///< The smallest element.
-    std::vector<Segment> segments;      ///< The segments composing the index.
+    // std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> segments;     ///< The segments composing the index.
+    std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> segments;
     std::vector<size_t> levels_offsets; ///< The starting position of each level in segments[], in reverse order.
 
     template<typename RandomIt>
     static void build(RandomIt first, RandomIt last,
                       size_t epsilon, size_t epsilon_recursive,
-                      std::vector<Segment> &segments,
+                    //   std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> &segments,
+                      std::vector<Segment, NVM::ComonAllocator<Segment, std::allocator<Segment>>> &segments,
                       std::vector<size_t> &levels_offsets) {
         auto n = (size_t) std::distance(first, last);
         if (n == 0)
